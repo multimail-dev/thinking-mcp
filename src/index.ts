@@ -3,14 +3,45 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { initDb } from "./db.js";
+import { initDb, db, uuid, persistDb } from "./db.js";
 import { toolPing, toolCapture, toolWhatDoIThink, toolWhatConnects, toolWhatTensionsExist, toolWhereAmIUncertain, toolSuggestExploration, toolHowWouldUserDecide, toolWhatHasChanged, toolCorrect, toolRecordOutcome, toolGetNode, toolGetNeighbors, toolSearchNodes, toolMergeNodes, toolArchiveNode } from "./tools.js";
 import { toolBootstrap, advanceBootstrap } from "./bootstrap.js";
 
 async function main() {
   await initDb();
 
-  const server = new McpServer({ name: "thinking-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "thinking-mcp", version: "0.2.0" });
+
+  // --- get_framing (call FIRST on every substantive query) ---
+  server.tool("get_framing",
+    "Get framing directives — lens-shaping questions that must be answered before any substantive response. CALL THIS FIRST on any substantive query, unconditionally. Framing is architecturally separated from knowledge retrieval: not activation-ranked, not similarity-matched — loaded verbatim, always. Answer each question visibly in your response, or state explicitly which you are skipping and why. READ-ONLY but traces every invocation. Hard-capped at 5.",
+    {},
+    () => {
+      const rows = db.exec("SELECT id, question, rationale, priority, version FROM framing ORDER BY priority ASC, id ASC");
+      const directives = rows.length > 0 ? rows[0].values.map((v: any[]) => ({
+        id: v[0], question: v[1], rationale: v[2], priority: v[3], version: v[4],
+      })) : [];
+      const traceId = uuid();
+      db.run(`INSERT INTO traces (id, tool_name, node_ids_touched) VALUES (?, 'get_framing', ?)`, [traceId, JSON.stringify(directives.map((d: any) => d.id))]);
+      persistDb();
+      const result = directives.length === 0
+        ? { directives: [], warning: "No framing directives configured. Use seed_framing or add a framing.yaml file.", trace_id: traceId }
+        : { directives, count: directives.length, protocol: "Answer each question visibly in your response, or state explicitly which you are skipping and why.", trace_id: traceId };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+    });
+
+  // --- seed_framing ---
+  server.tool("seed_framing",
+    "Seed or replace all framing directives. Hard-capped at 5. DESTRUCTIVE: replaces all existing directives. Each directive needs id, question, priority. Write your own — these are the questions that shape how you think before acting.",
+    { directives: z.array(z.object({ id: z.string(), question: z.string(), rationale: z.string().optional(), priority: z.number().default(0) })).max(5).describe("Array of framing directives (max 5)") },
+    ({ directives }) => {
+      db.run("DELETE FROM framing");
+      for (const d of directives) {
+        db.run("INSERT INTO framing (id, question, rationale, priority, version) VALUES (?, ?, ?, ?, 1)", [d.id, d.question, d.rationale ?? null, d.priority]);
+      }
+      persistDb();
+      return { content: [{ type: "text" as const, text: JSON.stringify({ seeded: directives.length, ids: directives.map(d => d.id) }) }] };
+    });
 
   server.tool("ping",
     "Health check. Returns node count, chunk count, and DB path. READ-ONLY.",

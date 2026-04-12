@@ -2,6 +2,7 @@
 import initSqlJs from "sql.js";
 import * as fs from "fs";
 import * as path from "path";
+import * as yaml from "js-yaml";
 import { DB_PATH } from "./types.js";
 
 export type Database = any;
@@ -75,12 +76,32 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS framing (
+  id TEXT PRIMARY KEY,
+  question TEXT NOT NULL,
+  rationale TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS traces (
+  id TEXT PRIMARY KEY,
+  tool_name TEXT NOT NULL,
+  query_text TEXT,
+  node_ids_touched TEXT,
+  agent_name TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_activation ON nodes(activation DESC);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
 CREATE INDEX IF NOT EXISTS idx_outcomes_node ON outcomes(node_id);
+CREATE INDEX IF NOT EXISTS idx_framing_priority ON framing(priority);
 `;
 
 function ensureDir(filePath: string) {
@@ -101,8 +122,40 @@ export async function initDb(): Promise<Database> {
   }
   db.run("PRAGMA foreign_keys = ON;");
   db.run(SCHEMA);
+  seedDefaultFraming();
   persistDb();
   return db;
+}
+
+/**
+ * Seeds framing directives from framing.yaml if the framing table is empty.
+ * framing.yaml ships with starter directives — users replace them with their own.
+ */
+function seedDefaultFraming() {
+  const existing = db.exec("SELECT COUNT(*) FROM framing");
+  const count = existing.length > 0 ? (existing[0].values[0][0] as number) : 0;
+  if (count > 0) return;
+
+  const candidates = [
+    path.resolve(__dirname, "..", "framing.yaml"),
+    path.resolve(__dirname, "..", "..", "framing.yaml"),
+  ];
+  const yamlPath = candidates.find((p) => fs.existsSync(p));
+  if (!yamlPath) {
+    console.warn("framing.yaml not found — use seed_framing to add directives.");
+    return;
+  }
+
+  const raw = fs.readFileSync(yamlPath, "utf-8");
+  const parsed = yaml.load(raw) as { directives?: Array<{ id: string; question: string; rationale?: string; priority: number; version?: number }> };
+  if (!parsed?.directives?.length) return;
+
+  for (const d of parsed.directives) {
+    db.run(
+      "INSERT INTO framing (id, question, rationale, priority, version) VALUES (?, ?, ?, ?, ?)",
+      [d.id, d.question, d.rationale ?? null, d.priority, d.version ?? 1]
+    );
+  }
 }
 
 export function persistDb() {
