@@ -91,15 +91,16 @@ export function vectorSearch(queryVec: number[], topK = 20): { chunkId: string; 
   return scored.slice(0, topK);
 }
 
-export function rrfFuse(rankings: Map<string, number>[]): Map<string, number> {
+export function rrfFuse(rankings: Map<string, number>[], weights?: number[]): Map<string, number> {
   const k = 60;
   const fused = new Map<string, number>();
-  for (const ranking of rankings) {
+  rankings.forEach((ranking, i) => {
+    const w = weights?.[i] ?? 1;
     const sorted = [...ranking.entries()].sort((a, b) => b[1] - a[1]);
     sorted.forEach(([id], rank) => {
-      fused.set(id, (fused.get(id) || 0) + 1 / (k + rank + 1));
+      fused.set(id, (fused.get(id) || 0) + w / (k + rank + 1));
     });
-  }
+  });
   return fused;
 }
 

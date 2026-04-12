@@ -93,13 +93,16 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
 
   const allIds = new Set([...vectorScores.keys(), ...keywordScores.keys()]);
   const activationScores = new Map<string, number>();
+  const outcomeScores = new Map<string, number>();
   for (const id of allIds) {
     const node = getNode(id);
     if (!node) continue;
     activationScores.set(id, decayedActivation(node.activation as number, node.last_accessed as string, node.type as string));
+    outcomeScores.set(id, (node.outcome_score as number | null) ?? 0);
   }
 
-  const fused = rrfFuse([vectorScores, keywordScores, activationScores]);
+  // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x
+  const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores], [3, 3, 1, 0.5]);
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
 
   for (const [id] of ranked) bumpActivation(id);
@@ -110,6 +113,7 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
     return {
       type: node.type, summary: node.summary, confidence: node.confidence,
       activation: decayedActivation(node.activation as number, node.last_accessed as string, node.type as string).toFixed(3),
+      outcome_score: node.outcome_score,
       first_seen: node.first_seen,
     };
   }).filter(Boolean);
@@ -323,17 +327,20 @@ export async function toolCorrect(nodeId: string, newSummary: string, newConfide
 
   const oldChunks = db.exec(`SELECT chunk_id FROM node_chunks WHERE node_id = '${nodeId}'`);
   const newChunkId = uuid();
-  if (oldChunks.length > 0) {
-    for (const row of oldChunks[0].values) {
-      db.run(`UPDATE chunks SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL`, [newChunkId, row[0]]);
-    }
-  }
 
+  // Insert new chunk FIRST so FK on superseded_by can reference it
   const vec = await embedOne(newSummary);
   if (vec) {
     db.run("INSERT INTO chunks (id, text, source_type, epistemic_tag, confidence) VALUES (?, ?, 'capture', 'assertion', ?)", [newChunkId, newSummary, newConfidence || "strong"]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, newChunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [newChunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    // Now supersede old chunks — new chunk exists so FK is satisfied
+    if (oldChunks.length > 0) {
+      for (const row of oldChunks[0].values) {
+        db.run(`UPDATE chunks SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL`, [newChunkId, row[0]]);
+      }
+    }
   }
 
   persistDb();
@@ -353,8 +360,34 @@ export function toolRecordOutcome(nodeId: string, outcome: string, score: number
   const newScore = currentScore === 0 ? score : (currentScore * 0.7 + score * 0.3);
   db.run("UPDATE nodes SET outcome_score = ?, last_accessed = ? WHERE id = ?", [newScore, now(), nodeId]);
 
+  // Propagate to neighbors via edge-type-aware dampening (1-hop only)
+  const PROP_WEIGHTS: Record<string, number> = { supports: 0.3, contradicts: -0.2, depends_on: 0.15 };
+  const edgeRows = queryNodes(
+    `SELECT id, type, source_node_id, target_node_id FROM edges WHERE source_node_id = '${nodeId}' OR target_node_id = '${nodeId}'`
+  );
+  let propagated = 0;
+  for (const edge of edgeRows) {
+    const w = PROP_WEIGHTS[edge.type as string];
+    if (w === undefined) continue;
+    const neighborId = (edge.source_node_id as string) === nodeId ? edge.target_node_id : edge.source_node_id;
+    db.run(
+      `UPDATE nodes SET outcome_score = COALESCE(outcome_score, 0) * 0.7 + ? * 0.3, last_accessed = ? WHERE id = ?`,
+      [score * w, now(), neighborId]
+    );
+    propagated++;
+  }
+
+  // Auto-update confidence after 3+ outcomes
+  const countRows = db.exec(`SELECT COUNT(*) FROM outcomes WHERE node_id = '${nodeId}'`);
+  const outcomeCount = countRows.length > 0 ? (countRows[0].values[0][0] as number) : 0;
+  if (outcomeCount >= 3) {
+    if (newScore > 0.5) db.run(`UPDATE nodes SET confidence = 'strong' WHERE id = ? AND confidence != 'strong'`, [nodeId]);
+    else if (newScore < -0.3) db.run(`UPDATE nodes SET confidence = 'uncertain' WHERE id = ? AND confidence != 'uncertain'`, [nodeId]);
+  }
+
   persistDb();
-  return `Recorded outcome for "${(existing.summary as string).slice(0, 50)}". Score: ${currentScore.toFixed(2)} -> ${newScore.toFixed(2)}`;
+  const propNote = propagated > 0 ? ` Propagated to ${propagated} neighbor(s).` : "";
+  return `Recorded outcome for "${(existing.summary as string).slice(0, 50)}". Score: ${currentScore.toFixed(2)} -> ${newScore.toFixed(2)}.${propNote}`;
 }
 
 // ---------------------------------------------------------------------------
