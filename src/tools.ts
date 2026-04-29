@@ -4,6 +4,8 @@ import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation, queryOne
 import { embedOne, validateDims, embeddingModel, embeddingDims, vectorSearch, cosine, rrfFuse, decayedActivation, hubDampen } from "./embed.js";
 import { extractPatterns } from "./extract.js";
 import { DB_PATH } from "./types.js";
+import { pagerank } from "./pagerank.js";
+import type { PREdge } from "./pagerank.js";
 
 // ---------------------------------------------------------------------------
 // Edge type inference heuristic
@@ -107,10 +109,74 @@ async function autoCreateEdges(
     }
     // Stage 2: vector-similarity fallback
     totalEdges += await createEdgesBySimilarity(nodeId, nodeType, embedding);
+    if (totalEdges > 0) invalidatePageRankCache();
   } catch (e) {
     console.error("Auto-edge creation error (non-fatal):", e);
   }
   return totalEdges;
+}
+
+// ---------------------------------------------------------------------------
+// PageRank computation with caching
+// ---------------------------------------------------------------------------
+
+const PAGERANK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let pageRankCache: { ranks: Map<string, number>; timestamp: number } | null = null;
+
+/**
+ * Compute PageRank over the node graph. Caches results for 5 minutes.
+ * Cache is invalidated when edges are created (auto-edge creation calls this
+ * implicitly on next retrieval).
+ */
+export function computePageRank(): Map<string, number> {
+  if (pageRankCache && Date.now() - pageRankCache.timestamp < PAGERANK_CACHE_TTL_MS) {
+    return pageRankCache.ranks;
+  }
+
+  const ranks = new Map<string, number>();
+  const edgeRows = db.exec("SELECT source_node_id, target_node_id, weight FROM edges");
+  if (edgeRows.length === 0 || edgeRows[0].values.length === 0) {
+    pageRankCache = { ranks, timestamp: Date.now() };
+    return ranks;
+  }
+
+  // Build node index: string ID → integer
+  const nodeIndex = new Map<string, number>();
+  const nodeIds: string[] = [];
+  for (const row of edgeRows[0].values) {
+    const src = row[0] as string;
+    const tgt = row[1] as string;
+    if (!nodeIndex.has(src)) { nodeIndex.set(src, nodeIds.length); nodeIds.push(src); }
+    if (!nodeIndex.has(tgt)) { nodeIndex.set(tgt, nodeIds.length); nodeIds.push(tgt); }
+  }
+
+  // Also include nodes with no edges (they get the uniform baseline)
+  const allNodeRows = db.exec("SELECT id FROM nodes");
+  if (allNodeRows.length > 0) {
+    for (const row of allNodeRows[0].values) {
+      const nid = row[0] as string;
+      if (!nodeIndex.has(nid)) { nodeIndex.set(nid, nodeIds.length); nodeIds.push(nid); }
+    }
+  }
+
+  const prEdges: PREdge[] = edgeRows[0].values.map((row: any[]) => ({
+    source: nodeIndex.get(row[0] as string)!,
+    target: nodeIndex.get(row[1] as string)!,
+    weight: row[2] as number,
+  }));
+
+  const prResult = pagerank(nodeIds.length, prEdges);
+  for (let i = 0; i < nodeIds.length; i++) {
+    ranks.set(nodeIds[i], prResult[i]);
+  }
+
+  pageRankCache = { ranks, timestamp: Date.now() };
+  return ranks;
+}
+
+/** Invalidate cached PageRank (call after edge mutations). */
+export function invalidatePageRankCache(): void {
+  pageRankCache = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,9 +186,11 @@ async function autoCreateEdges(
 export function toolPing(): string {
   const nodeCount = db.exec("SELECT COUNT(*) FROM nodes");
   const chunkCount = db.exec("SELECT COUNT(*) FROM chunks");
+  const edgeCount = db.exec("SELECT COUNT(*) FROM edges");
   const n = nodeCount[0]?.values[0]?.[0] || 0;
   const c = chunkCount[0]?.values[0]?.[0] || 0;
-  return `thinking-mcp online. ${n} nodes, ${c} chunks. DB: ${DB_PATH}`;
+  const e = edgeCount[0]?.values[0]?.[0] || 0;
+  return `thinking-mcp online. ${n} nodes, ${c} chunks, ${e} edges. DB: ${DB_PATH}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +300,11 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
     outcomeScores.set(id, (node.outcome_score as number | null) ?? 0);
   }
 
-  // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x
-  const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores], [3, 3, 1, 0.5]);
+  // PageRank: structural importance signal (5th channel)
+  const pageRankScores = computePageRank();
+
+  // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x, pagerank 2x
+  const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores, pageRankScores], [3, 3, 1, 0.5, 2]);
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
 
   for (const [id] of ranked) bumpActivation(id);
@@ -241,10 +312,12 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
   const positions = ranked.map(([id]) => {
     const node = getNode(id);
     if (!node) return null;
+    const pr = pageRankScores.get(id);
     return {
       type: node.type, summary: node.summary, confidence: node.confidence,
       activation: decayedActivation(node.activation as number, node.last_accessed as string, node.type as string).toFixed(3),
       outcome_score: node.outcome_score,
+      pagerank: pr !== undefined ? pr.toFixed(6) : null,
       first_seen: node.first_seen,
     };
   }).filter(Boolean);
@@ -364,17 +437,20 @@ export async function toolSuggestExploration(currentContext: string): Promise<st
     }
   }
 
-  const candidates: { id: string; type: string; summary: string; activation: number; similarity: number }[] = [];
+  const prScores = computePageRank();
+  const candidates: { id: string; type: string; summary: string; activation: number; similarity: number; pagerank: number }[] = [];
   for (const [id, similarity] of nodeScores) {
     const node = getNode(id);
     if (!node) continue;
     const act = decayedActivation(node.activation as number, node.last_accessed as string, node.type as string);
     if (act < 0.5 && similarity > 0.15) {
-      candidates.push({ id, type: node.type as string, summary: node.summary as string, activation: act, similarity });
+      const pr = prScores.get(id) ?? 0;
+      candidates.push({ id, type: node.type as string, summary: node.summary as string, activation: act, similarity, pagerank: pr });
     }
   }
 
-  candidates.sort((a, b) => b.similarity - a.similarity);
+  // Sort by similarity boosted by PageRank (structurally important forgotten nodes rank higher)
+  candidates.sort((a, b) => (b.similarity + b.pagerank * 10) - (a.similarity + a.pagerank * 10));
   const typeSeen = new Set<string>();
   const diverse: typeof candidates = [];
   for (const c of candidates) {
@@ -400,16 +476,19 @@ export async function toolHowWouldUserDecide(context: string, options?: string):
     if (nc.length > 0) nc[0].values.forEach((r: any[]) => nodeIds.add(r[0] as string));
   }
 
-  const grouped: Record<string, { summary: string; confidence: string; activation: number }[]> = {};
+  const prScores = computePageRank();
+  const grouped: Record<string, { summary: string; confidence: string; activation: number; pagerank: number }[]> = {};
   for (const id of nodeIds) {
     const node = getNode(id);
     if (!node) continue;
     const t = node.type as string;
     if (!["heuristic", "value", "mental_model", "preference", "assumption"].includes(t)) continue;
     if (!grouped[t]) grouped[t] = [];
-    grouped[t].push({ summary: node.summary as string, confidence: node.confidence as string, activation: decayedActivation(node.activation as number, node.last_accessed as string, t) });
+    const pr = prScores.get(id) ?? 0;
+    grouped[t].push({ summary: node.summary as string, confidence: node.confidence as string, activation: decayedActivation(node.activation as number, node.last_accessed as string, t), pagerank: pr });
   }
-  for (const t in grouped) grouped[t].sort((a, b) => b.activation - a.activation);
+  // Sort by activation boosted by PageRank
+  for (const t in grouped) grouped[t].sort((a, b) => (b.activation + b.pagerank * 5) - (a.activation + a.pagerank * 5));
 
   return JSON.stringify({ context, options: options || null, reasoning_inputs: grouped }, null, 2);
 }
