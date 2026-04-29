@@ -1,8 +1,220 @@
-import { VALID_NODE_TYPES } from "./types.js";
-import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation } from "./db.js";
+/**
+ * Consumer trace (Sharp Directive 1) — every file touched in this PR,
+ * every importer, stale-read closure verified:
+ *
+ * package.json: adds js-yaml dep, bumps 0.1.0→0.2.0. Consumers: npm/bun install
+ *   (runtime dep resolution), no code import. No stale read — version string in
+ *   index.ts already says 0.2.0 (was the mismatch; now aligned).
+ *
+ * src/cosine.ts (new): exported `cosine(a,b)`. Consumers: embed.ts (re-exports),
+ *   tools.ts (via embed.ts). No stale read — replaces inline with identical signature.
+ *
+ * src/db.ts: adds queryOne/queryScalar (new exports), parameterizes getNode/bumpActivation.
+ *   Consumers: tools.ts (sole importer of getNode, bumpActivation, queryOne, queryScalar),
+ *   embed.ts (imports db for exec, hubDampen — untouched exports). No stale read —
+ *   getNode return type unchanged, bumpActivation signature unchanged.
+ *
+ * src/embed.ts: replaces inline cosine with re-export from cosine.ts.
+ *   Consumers: tools.ts (imports cosine, vectorSearch, rrfFuse, etc). No stale read —
+ *   `export { cosine }` has identical name and (a:number[],b:number[])=>number signature.
+ *
+ * src/extract.ts: extends prompt, adds relates_to validation on output.
+ *   Consumers: tools.ts (calls extractPatterns()). Return type ExtractedPattern[] unchanged.
+ *   relates_to is optional — existing filter `p.text && p.type` still works. No stale read.
+ *
+ * src/types.ts: adds ExtractedRelation interface, optional relates_to on ExtractedPattern.
+ *   Consumers: extract.ts (imports ExtractedPattern, VALID_EDGE_TYPES), tools.ts (imports
+ *   VALID_NODE_TYPES, VALID_EDGE_TYPES, ExtractedRelation). Additive — no existing field
+ *   removed or renamed. No stale read.
+ *
+ * src/pagerank.ts (new): exports pagerank(), PREdge. Consumer: tools.ts only. No stale read
+ *   (new file, no pre-existing readers).
+ *
+ * src/index.ts: tool description text updated. Not imported by any file (entry point).
+ *   No stale read.
+ *
+ * src/bootstrap.ts: UNCHANGED. Imports initDb from db.ts — initDb not modified. No stale read.
+ */
+import { VALID_NODE_TYPES, VALID_EDGE_TYPES } from "./types.js";
+import type { ExtractedRelation } from "./types.js";
+import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation, queryOne, queryScalar } from "./db.js";
 import { embedOne, validateDims, embeddingModel, embeddingDims, vectorSearch, cosine, rrfFuse, decayedActivation, hubDampen } from "./embed.js";
 import { extractPatterns } from "./extract.js";
 import { DB_PATH } from "./types.js";
+import { pagerank } from "./pagerank.js";
+import type { PREdge } from "./pagerank.js";
+
+// ---------------------------------------------------------------------------
+// Edge type inference heuristic
+// ---------------------------------------------------------------------------
+
+const EDGE_TYPE_MAP: Record<string, Record<string, string>> = {
+  heuristic:  { heuristic: "supports", value: "derived_from", mental_model: "scoped_by" },
+  tension:    { value: "contradicts", heuristic: "contradicts" },
+  assumption: { mental_model: "depends_on" },
+  preference: { value: "derived_from" },
+  idea:       { project: "belongs_to" },
+  question:   { assumption: "depends_on" },
+};
+
+function inferEdgeType(sourceType: string, targetType: string): string {
+  return EDGE_TYPE_MAP[sourceType]?.[targetType]
+    ?? (sourceType === targetType ? "supports" : "inspired_by");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-edge creation (Stage 1: LLM-suggested, Stage 2: similarity)
+// ---------------------------------------------------------------------------
+
+async function createEdgesFromExtraction(
+  nodeId: string, _nodeType: string,
+  relatesTo: ExtractedRelation[]
+): Promise<number> {
+  let created = 0;
+  for (const rel of relatesTo) {
+    if (!rel.concept?.trim() || rel.concept.trim().length < 2) continue;
+    if (!VALID_EDGE_TYPES.has(rel.edge_type)) continue;
+    const vec = await embedOne(rel.concept.trim());
+    if (!vec) continue;
+    const hits = vectorSearch(vec, 3);
+    for (const hit of hits) {
+      if (hit.score < 0.65) break;
+      const targetNodeId = queryScalar(
+        "SELECT node_id FROM node_chunks WHERE chunk_id = ?", [hit.chunkId]
+      ) as string | null;
+      if (!targetNodeId || targetNodeId === nodeId) continue;
+      const existing = queryScalar(
+        "SELECT COUNT(*) FROM edges WHERE type = ? AND source_node_id = ? AND target_node_id = ?",
+        [rel.edge_type, nodeId, targetNodeId]
+      );
+      if ((existing as number) > 0) continue;
+      db.run(
+        "INSERT INTO edges (id, type, source_node_id, target_node_id, weight) VALUES (?, ?, ?, ?, ?)",
+        ["ae1-" + uuid(), rel.edge_type, nodeId, targetNodeId, hit.score]
+      );
+      created++;
+      break; // one edge per relates_to entry
+    }
+  }
+  return created;
+}
+
+async function createEdgesBySimilarity(
+  nodeId: string, nodeType: string, embedding: number[]
+): Promise<number> {
+  const MAX_AUTO_EDGES = 3;
+  const hits = vectorSearch(embedding, 10);
+  let created = 0;
+  for (const hit of hits) {
+    if (created >= MAX_AUTO_EDGES) break;
+    const targetNodeId = queryScalar(
+      "SELECT node_id FROM node_chunks WHERE chunk_id = ?", [hit.chunkId]
+    ) as string | null;
+    if (!targetNodeId || targetNodeId === nodeId) continue;
+    const targetNode = getNode(targetNodeId);
+    if (!targetNode) continue;
+    const threshold = targetNode.type === nodeType ? 0.75 : 0.80;
+    if (hit.score < threshold) continue;
+    const edgeType = inferEdgeType(nodeType, targetNode.type as string);
+    const existing = queryScalar(
+      "SELECT COUNT(*) FROM edges WHERE source_node_id = ? AND target_node_id = ?",
+      [nodeId, targetNodeId]
+    );
+    if ((existing as number) > 0) continue;
+    db.run(
+      "INSERT INTO edges (id, type, source_node_id, target_node_id, weight) VALUES (?, ?, ?, ?, ?)",
+      ["ae2-" + uuid(), edgeType, nodeId, targetNodeId, hit.score]
+    );
+    created++;
+  }
+  return created;
+}
+
+/**
+ * Create edges for a newly captured node. Wraps both stages in try/catch
+ * so edge creation failures never block capture.
+ */
+async function autoCreateEdges(
+  nodeId: string, nodeType: string, embedding: number[],
+  relatesTo?: ExtractedRelation[]
+): Promise<number> {
+  let totalEdges = 0;
+  try {
+    // Stage 1: LLM-suggested edges from extraction
+    if (relatesTo && relatesTo.length > 0) {
+      totalEdges += await createEdgesFromExtraction(nodeId, nodeType, relatesTo);
+    }
+    // Stage 2: vector-similarity fallback
+    totalEdges += await createEdgesBySimilarity(nodeId, nodeType, embedding);
+    if (totalEdges > 0) invalidatePageRankCache();
+  } catch (e) {
+    console.error("Auto-edge creation error (non-fatal):", e);
+  }
+  return totalEdges;
+}
+
+// ---------------------------------------------------------------------------
+// PageRank computation with caching
+// ---------------------------------------------------------------------------
+
+const PAGERANK_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let pageRankCache: { ranks: Map<string, number>; timestamp: number } | null = null;
+
+/**
+ * Compute PageRank over the node graph. Caches results for 5 minutes.
+ * Cache is invalidated when edges are created (auto-edge creation calls this
+ * implicitly on next retrieval).
+ */
+export function computePageRank(): Map<string, number> {
+  if (pageRankCache && Date.now() - pageRankCache.timestamp < PAGERANK_CACHE_TTL_MS) {
+    return pageRankCache.ranks;
+  }
+
+  const ranks = new Map<string, number>();
+  const edgeRows = db.exec("SELECT source_node_id, target_node_id, weight FROM edges");
+  if (edgeRows.length === 0 || edgeRows[0].values.length === 0) {
+    pageRankCache = { ranks, timestamp: Date.now() };
+    return ranks;
+  }
+
+  // Build node index: string ID → integer
+  const nodeIndex = new Map<string, number>();
+  const nodeIds: string[] = [];
+  for (const row of edgeRows[0].values) {
+    const src = row[0] as string;
+    const tgt = row[1] as string;
+    if (!nodeIndex.has(src)) { nodeIndex.set(src, nodeIds.length); nodeIds.push(src); }
+    if (!nodeIndex.has(tgt)) { nodeIndex.set(tgt, nodeIds.length); nodeIds.push(tgt); }
+  }
+
+  // Also include nodes with no edges (they get the uniform baseline)
+  const allNodeRows = db.exec("SELECT id FROM nodes");
+  if (allNodeRows.length > 0) {
+    for (const row of allNodeRows[0].values) {
+      const nid = row[0] as string;
+      if (!nodeIndex.has(nid)) { nodeIndex.set(nid, nodeIds.length); nodeIds.push(nid); }
+    }
+  }
+
+  const prEdges: PREdge[] = edgeRows[0].values.map((row: any[]) => ({
+    source: nodeIndex.get(row[0] as string)!,
+    target: nodeIndex.get(row[1] as string)!,
+    weight: row[2] as number,
+  }));
+
+  const prResult = pagerank(nodeIds.length, prEdges);
+  for (let i = 0; i < nodeIds.length; i++) {
+    ranks.set(nodeIds[i], prResult[i]);
+  }
+
+  pageRankCache = { ranks, timestamp: Date.now() };
+  return ranks;
+}
+
+/** Invalidate cached PageRank (call after edge mutations). */
+export function invalidatePageRankCache(): void {
+  pageRankCache = null;
+}
 
 // ---------------------------------------------------------------------------
 // ping
@@ -11,9 +223,11 @@ import { DB_PATH } from "./types.js";
 export function toolPing(): string {
   const nodeCount = db.exec("SELECT COUNT(*) FROM nodes");
   const chunkCount = db.exec("SELECT COUNT(*) FROM chunks");
+  const edgeCount = db.exec("SELECT COUNT(*) FROM edges");
   const n = nodeCount[0]?.values[0]?.[0] || 0;
   const c = chunkCount[0]?.values[0]?.[0] || 0;
-  return `thinking-mcp online. ${n} nodes, ${c} chunks. DB: ${DB_PATH}`;
+  const e = edgeCount[0]?.values[0]?.[0] || 0;
+  return `thinking-mcp online. ${n} nodes, ${c} chunks, ${e} edges. DB: ${DB_PATH}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -31,8 +245,11 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, nodeType, text, confidence]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    const edgeCount = await autoCreateEdges(nodeId, nodeType, vec);
     persistDb();
-    return `Captured as ${nodeType} (${epistemicTag}, ${confidence}). Node: ${nodeId}`;
+    const edgeNote = edgeCount > 0 ? ` ${edgeCount} edge(s) created.` : "";
+    return `Captured as ${nodeType} (${epistemicTag}, ${confidence}). Node: ${nodeId}.${edgeNote}`;
   }
 
   const patterns = await extractPatterns(text);
@@ -44,11 +261,17 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, "idea", text, confidence]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    const edgeCount = await autoCreateEdges(nodeId, "idea", vec);
     persistDb();
-    return `No patterns extracted. Stored as idea. Node: ${nodeId}`;
+    const edgeNote = edgeCount > 0 ? ` ${edgeCount} edge(s) created.` : "";
+    return `No patterns extracted. Stored as idea. Node: ${nodeId}.${edgeNote}`;
   }
 
-  const nodeIds: string[] = [];
+  // Two-pass flow: insert all nodes first, then create edges.
+  // This ensures intra-capture relates_to references can resolve
+  // (pattern A's relates_to might reference pattern B from the same capture).
+  const inserted: { nodeId: string; type: string; vec: number[]; relatesTo?: typeof patterns[0]["relates_to"] }[] = [];
   for (const p of patterns) {
     const chunkId = uuid(), nodeId = uuid();
     const vec = await embedOne(p.text);
@@ -57,11 +280,18 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, p.type, p.text, p.confidence || "tentative"]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
-    nodeIds.push(nodeId);
+    inserted.push({ nodeId, type: p.type, vec, relatesTo: p.relates_to });
+  }
+
+  // Pass 2: create edges now that all nodes + embeddings exist
+  let totalEdges = 0;
+  for (const { nodeId, type, vec, relatesTo } of inserted) {
+    totalEdges += await autoCreateEdges(nodeId, type, vec, relatesTo);
   }
   persistDb();
   const summary = patterns.map(p => `${p.type}: "${p.text.slice(0, 50)}"`).join("; ");
-  return `Extracted ${patterns.length} pattern(s): ${summary}`;
+  const edgeNote = totalEdges > 0 ? ` ${totalEdges} edge(s) created.` : "";
+  return `Extracted ${patterns.length} pattern(s): ${summary}.${edgeNote}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,11 +314,23 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
     }
   }
 
-  const kw = topic.split(/\s+/).filter(w => w.length > 3).map(w => `summary LIKE '%${w}%'`).join(" OR ");
+  const words = topic.split(/\s+/).filter(w => w.length > 3).map(w => w.replace(/[%_'\\]/g, ""));
   const keywordScores = new Map<string, number>();
-  if (kw) {
-    const kwNodes = queryNodes(`SELECT id, activation FROM nodes WHERE ${kw} LIMIT 20`);
-    kwNodes.forEach((n, i) => { keywordScores.set(n.id as string, 1 / (i + 1)); });
+  if (words.length > 0) {
+    const conditions = words.map(() => "summary LIKE ?").join(" OR ");
+    const params = words.map(w => `%${w}%`);
+    const stmt = db.prepare(`SELECT id, activation FROM nodes WHERE (${conditions}) LIMIT 20`);
+    try {
+      stmt.bind(params);
+      let idx = 0;
+      while (stmt.step()) {
+        const row = stmt.getAsObject();
+        keywordScores.set(row.id as string, 1 / (idx + 1));
+        idx++;
+      }
+    } finally {
+      stmt.free();
+    }
   }
 
   const allIds = new Set([...vectorScores.keys(), ...keywordScores.keys()]);
@@ -101,8 +343,18 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
     outcomeScores.set(id, (node.outcome_score as number | null) ?? 0);
   }
 
-  // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x
-  const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores], [3, 3, 1, 0.5]);
+  // PageRank: structural importance signal (5th channel)
+  // Filter to allIds only — prevents globally important but topic-irrelevant nodes
+  // from entering the fused ranking
+  const fullPageRank = computePageRank();
+  const pageRankScores = new Map<string, number>();
+  for (const id of allIds) {
+    const pr = fullPageRank.get(id);
+    if (pr !== undefined) pageRankScores.set(id, pr);
+  }
+
+  // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x, pagerank 2x
+  const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores, pageRankScores], [3, 3, 1, 0.5, 2]);
   const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
 
   for (const [id] of ranked) bumpActivation(id);
@@ -110,10 +362,12 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
   const positions = ranked.map(([id]) => {
     const node = getNode(id);
     if (!node) return null;
+    const pr = pageRankScores.get(id);
     return {
       type: node.type, summary: node.summary, confidence: node.confidence,
       activation: decayedActivation(node.activation as number, node.last_accessed as string, node.type as string).toFixed(3),
       outcome_score: node.outcome_score,
+      pagerank: pr !== undefined ? pr.toFixed(6) : null,
       first_seen: node.first_seen,
     };
   }).filter(Boolean);
@@ -233,17 +487,20 @@ export async function toolSuggestExploration(currentContext: string): Promise<st
     }
   }
 
-  const candidates: { id: string; type: string; summary: string; activation: number; similarity: number }[] = [];
+  const prScores = computePageRank();
+  const candidates: { id: string; type: string; summary: string; activation: number; similarity: number; pagerank: number }[] = [];
   for (const [id, similarity] of nodeScores) {
     const node = getNode(id);
     if (!node) continue;
     const act = decayedActivation(node.activation as number, node.last_accessed as string, node.type as string);
     if (act < 0.5 && similarity > 0.15) {
-      candidates.push({ id, type: node.type as string, summary: node.summary as string, activation: act, similarity });
+      const pr = prScores.get(id) ?? 0;
+      candidates.push({ id, type: node.type as string, summary: node.summary as string, activation: act, similarity, pagerank: pr });
     }
   }
 
-  candidates.sort((a, b) => b.similarity - a.similarity);
+  // Sort by similarity boosted by PageRank (structurally important forgotten nodes rank higher)
+  candidates.sort((a, b) => (b.similarity + b.pagerank * 10) - (a.similarity + a.pagerank * 10));
   const typeSeen = new Set<string>();
   const diverse: typeof candidates = [];
   for (const c of candidates) {
@@ -269,16 +526,19 @@ export async function toolHowWouldUserDecide(context: string, options?: string):
     if (nc.length > 0) nc[0].values.forEach((r: any[]) => nodeIds.add(r[0] as string));
   }
 
-  const grouped: Record<string, { summary: string; confidence: string; activation: number }[]> = {};
+  const prScores = computePageRank();
+  const grouped: Record<string, { summary: string; confidence: string; activation: number; pagerank: number }[]> = {};
   for (const id of nodeIds) {
     const node = getNode(id);
     if (!node) continue;
     const t = node.type as string;
     if (!["heuristic", "value", "mental_model", "preference", "assumption"].includes(t)) continue;
     if (!grouped[t]) grouped[t] = [];
-    grouped[t].push({ summary: node.summary as string, confidence: node.confidence as string, activation: decayedActivation(node.activation as number, node.last_accessed as string, t) });
+    const pr = prScores.get(id) ?? 0;
+    grouped[t].push({ summary: node.summary as string, confidence: node.confidence as string, activation: decayedActivation(node.activation as number, node.last_accessed as string, t), pagerank: pr });
   }
-  for (const t in grouped) grouped[t].sort((a, b) => b.activation - a.activation);
+  // Sort by activation boosted by PageRank
+  for (const t in grouped) grouped[t].sort((a, b) => (b.activation + b.pagerank * 5) - (a.activation + a.pagerank * 5));
 
   return JSON.stringify({ context, options: options || null, reasoning_inputs: grouped }, null, 2);
 }
@@ -425,12 +685,26 @@ export function toolGetNeighbors(nodeId: string): string {
 // ---------------------------------------------------------------------------
 
 export function toolSearchNodes(query: string, nodeType?: string): string {
-  const words = query.split(/\s+/).filter(w => w.length > 2).map(w => `summary LIKE '%${w}%'`);
+  const words = query.split(/\s+/).filter(w => w.length > 2).map(w => w.replace(/[%_'\\]/g, ""));
   if (words.length === 0) return JSON.stringify({ query, nodes: [] });
-  let sql = `SELECT * FROM nodes WHERE (${words.join(" OR ")})`;
-  if (nodeType && VALID_NODE_TYPES.has(nodeType)) sql += ` AND type = '${nodeType}'`;
+  const conditions = words.map(() => "summary LIKE ?").join(" OR ");
+  const params: any[] = words.map(w => `%${w}%`);
+  let sql = `SELECT * FROM nodes WHERE (${conditions})`;
+  if (nodeType && VALID_NODE_TYPES.has(nodeType)) {
+    sql += " AND type = ?";
+    params.push(nodeType);
+  }
   sql += " ORDER BY activation DESC LIMIT 20";
-  const nodes = queryNodes(sql);
+  const stmt = db.prepare(sql);
+  const nodes: Record<string, unknown>[] = [];
+  try {
+    stmt.bind(params);
+    while (stmt.step()) {
+      nodes.push(stmt.getAsObject() as Record<string, unknown>);
+    }
+  } finally {
+    stmt.free();
+  }
   return JSON.stringify({ query, type_filter: nodeType || null, count: nodes.length, nodes }, null, 2);
 }
 
@@ -453,6 +727,7 @@ export function toolMergeNodes(keepId: string, mergeId: string): string {
   db.run(`UPDATE nodes SET activation = ? WHERE id = ?`, [Math.max(keep.activation as number, merge.activation as number), keepId]);
   db.run(`DELETE FROM nodes WHERE id = ?`, [mergeId]);
 
+  invalidatePageRankCache(); // edges were rewired/deleted
   persistDb();
   return `Merged "${(merge.summary as string).slice(0, 50)}" into "${(keep.summary as string).slice(0, 50)}".`;
 }

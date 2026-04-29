@@ -48,7 +48,7 @@ async function main() {
     {}, () => ({ content: [{ type: "text" as const, text: toolPing() }] }));
 
   server.tool("capture",
-    "Capture a thought into the cognitive graph. If nodeType is provided, stores as that type directly. If omitted, runs inline extraction to classify the text into properly typed nodes. WRITES to SQLite. Does NOT create edges between nodes.",
+    "Capture a thought into the cognitive graph. If nodeType is provided, stores as that type directly and creates edges to related existing nodes via vector similarity. If omitted, runs inline extraction to classify the text into properly typed nodes and creates edges via both LLM-suggested relationships and vector similarity. WRITES to SQLite.",
     {
       text: z.string().describe("The thought, observation, or raw text to capture"),
       nodeType: z.string().optional().describe("Optional. Skips extraction if provided. Valid: idea, question, heuristic, value, mental_model, assumption, tension, preference, project"),

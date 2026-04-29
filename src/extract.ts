@@ -1,4 +1,4 @@
-import { ANTHROPIC_API_KEY, VALID_NODE_TYPES, VALID_CONFIDENCE, VALID_EPISTEMIC_TAGS } from "./types.js";
+import { ANTHROPIC_API_KEY, VALID_NODE_TYPES, VALID_CONFIDENCE, VALID_EPISTEMIC_TAGS, VALID_EDGE_TYPES } from "./types.js";
 import type { ExtractedPattern } from "./types.js";
 
 const EXTRACTION_PROMPT = `You are extracting cognitive patterns from text. Extract ONLY patterns that reveal how the user thinks, decides, or evaluates.
@@ -8,6 +8,9 @@ For each pattern, output a JSON object:
 - "type": One of: heuristic, mental_model, preference, value, assumption, tension, question, project, idea
 - "confidence": strong | tentative | uncertain
 - "epistemic": assertion | hypothesis | speculation
+- "relates_to": Optional array of connections to concepts you've seen in this text or that logically connect.
+  Each entry: { "concept": "short description", "edge_type": "supports|contradicts|depends_on|inspired_by|scoped_by|derived_from" }
+  Only include if the relationship is clear. 0-3 entries per pattern.
 
 Type selection, work through IN ORDER (do NOT default to "idea"):
 1. Decision rule or "when X, do Y"? -> heuristic
@@ -48,11 +51,21 @@ export async function extractPatterns(text: string): Promise<ExtractedPattern[]>
     const match = content.match(/\[[\s\S]*\]/);
     if (!match) return [];
     const parsed = JSON.parse(match[0]) as ExtractedPattern[];
-    return parsed.filter(p =>
-      p.text && p.type && VALID_NODE_TYPES.has(p.type) &&
-      VALID_CONFIDENCE.has(p.confidence || "tentative") &&
-      VALID_EPISTEMIC_TAGS.has(p.epistemic || "assertion")
-    );
+    return parsed
+      .filter(p =>
+        p.text && p.type && VALID_NODE_TYPES.has(p.type) &&
+        VALID_CONFIDENCE.has(p.confidence || "tentative") &&
+        VALID_EPISTEMIC_TAGS.has(p.epistemic || "assertion")
+      )
+      .map(p => ({
+        ...p,
+        // Validate relates_to: keep only entries with non-empty concept and valid edge_type
+        relates_to: Array.isArray(p.relates_to)
+          ? p.relates_to.filter(r =>
+              r.concept?.trim()?.length >= 2 && VALID_EDGE_TYPES.has(r.edge_type)
+            )
+          : undefined,
+      }));
   } catch {
     return [];
   }

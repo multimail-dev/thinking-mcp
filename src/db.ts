@@ -175,14 +175,28 @@ export function now(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
+/**
+ * Parameterized single-row read. Uses try/finally to prevent stmt memory
+ * leak if bind() throws. sql.js's exec() does not accept parameters —
+ * use this helper for any read that takes user-supplied or variable input.
+ */
+export function queryOne(sql: string, params: any[]): Record<string, any> | null {
+  const stmt = db.prepare(sql);
+  try {
+    stmt.bind(params);
+    return stmt.step() ? stmt.getAsObject() : null;
+  } finally {
+    stmt.free();
+  }
+}
+
+export function queryScalar(sql: string, params: any[]): any {
+  const row = queryOne(sql, params);
+  return row ? Object.values(row)[0] : null;
+}
+
 export function getNode(nodeId: string): Record<string, unknown> | null {
-  const rows = db.exec(`SELECT * FROM nodes WHERE id = '${nodeId}'`);
-  if (rows.length === 0 || rows[0].values.length === 0) return null;
-  const cols = rows[0].columns;
-  const vals = rows[0].values[0];
-  const obj: Record<string, unknown> = {};
-  cols.forEach((c: string, i: number) => { obj[c] = vals[i]; });
-  return obj;
+  return queryOne("SELECT * FROM nodes WHERE id = ?", [nodeId]);
 }
 
 export function queryNodes(sql: string): Record<string, unknown>[] {
@@ -196,5 +210,5 @@ export function queryNodes(sql: string): Record<string, unknown>[] {
 }
 
 export function bumpActivation(nodeId: string) {
-  db.run(`UPDATE nodes SET activation = MIN(activation + 0.1, 1.0), last_accessed = '${now()}' WHERE id = '${nodeId}'`);
+  db.run("UPDATE nodes SET activation = MIN(activation + 0.1, 1.0), last_accessed = ? WHERE id = ?", [now(), nodeId]);
 }
