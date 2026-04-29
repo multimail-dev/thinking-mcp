@@ -1,18 +1,39 @@
 /**
- * Consumer trace (Sharp Directive 1):
+ * Consumer trace (Sharp Directive 1) — every file touched in this PR,
+ * every importer, stale-read closure verified:
  *
- * This file imports from: types.ts, db.ts, embed.ts, extract.ts, pagerank.ts
- * This file is imported by: index.ts (tool registration only, no signature changes)
+ * package.json: adds js-yaml dep, bumps 0.1.0→0.2.0. Consumers: npm/bun install
+ *   (runtime dep resolution), no code import. No stale read — version string in
+ *   index.ts already says 0.2.0 (was the mismatch; now aligned).
  *
- * Changed surfaces in this PR and their consumers:
- *   cosine.ts (new) → embed.ts re-exports it; tools.ts consumes via embed.ts. Same signature.
- *   db.ts (queryOne/queryScalar new; getNode/bumpActivation parameterized) → tools.ts only consumer. Signatures unchanged.
- *   embed.ts (cosine re-export replaces inline) → tools.ts imports cosine. Name+signature identical.
- *   extract.ts (prompt extended; relates_to validation) → tools.ts calls extractPatterns(). Return type unchanged.
- *   types.ts (ExtractedRelation new; relates_to optional on ExtractedPattern) → extract.ts, tools.ts. Optional field.
- *   pagerank.ts (new) → tools.ts only consumer.
- *   index.ts (description text) → entry point, not imported by anything.
- *   bootstrap.ts → unchanged, not affected.
+ * src/cosine.ts (new): exported `cosine(a,b)`. Consumers: embed.ts (re-exports),
+ *   tools.ts (via embed.ts). No stale read — replaces inline with identical signature.
+ *
+ * src/db.ts: adds queryOne/queryScalar (new exports), parameterizes getNode/bumpActivation.
+ *   Consumers: tools.ts (sole importer of getNode, bumpActivation, queryOne, queryScalar),
+ *   embed.ts (imports db for exec, hubDampen — untouched exports). No stale read —
+ *   getNode return type unchanged, bumpActivation signature unchanged.
+ *
+ * src/embed.ts: replaces inline cosine with re-export from cosine.ts.
+ *   Consumers: tools.ts (imports cosine, vectorSearch, rrfFuse, etc). No stale read —
+ *   `export { cosine }` has identical name and (a:number[],b:number[])=>number signature.
+ *
+ * src/extract.ts: extends prompt, adds relates_to validation on output.
+ *   Consumers: tools.ts (calls extractPatterns()). Return type ExtractedPattern[] unchanged.
+ *   relates_to is optional — existing filter `p.text && p.type` still works. No stale read.
+ *
+ * src/types.ts: adds ExtractedRelation interface, optional relates_to on ExtractedPattern.
+ *   Consumers: extract.ts (imports ExtractedPattern, VALID_EDGE_TYPES), tools.ts (imports
+ *   VALID_NODE_TYPES, VALID_EDGE_TYPES, ExtractedRelation). Additive — no existing field
+ *   removed or renamed. No stale read.
+ *
+ * src/pagerank.ts (new): exports pagerank(), PREdge. Consumer: tools.ts only. No stale read
+ *   (new file, no pre-existing readers).
+ *
+ * src/index.ts: tool description text updated. Not imported by any file (entry point).
+ *   No stale read.
+ *
+ * src/bootstrap.ts: UNCHANGED. Imports initDb from db.ts — initDb not modified. No stale read.
  */
 import { VALID_NODE_TYPES, VALID_EDGE_TYPES } from "./types.js";
 import type { ExtractedRelation } from "./types.js";
