@@ -23,61 +23,63 @@ Works with Claude Code, Claude Desktop, Cursor, Windsurf, and any MCP client.
 
 ## What this is
 
-Every conversation you have contains cognitive patterns you don't notice. Decision rules you apply without naming them. Tensions between things you believe. Assumptions you've never tested.
+Every conversation contains cognitive patterns you don't notice. Decision rules you apply without naming them. Tensions between things you believe. Assumptions you've never tested.
 
-This server extracts those patterns, stores them in a typed graph, and lets any AI agent query them over MCP. The agent can find contradictions in your thinking, bridge connections between domains you never linked, or predict how you'd approach a decision you haven't faced yet.
+Kahneman calls it System 1 — fast, automatic, invisible. The heuristics that fire before you know you're deciding. Most AI memory systems store what you said. This models how you decide.
 
-It is not a memory system. Memory stores what you said. This models how you decide.
+thinking-mcp captures your heuristics, values, tensions, assumptions, preferences, and mental models as a typed graph. Nodes connect through real edges — supports, contradicts, depends on, evolved into. When an agent queries the graph, structurally important patterns surface first.
+
+It is not a memory vault. It is a mirror for your decision architecture.
 
 ## First run
 
-On first use, the server walks you through a bootstrap conversation. It starts with a real decision you made recently and works backward to understand your heuristics, mental models, and assumptions. Takes about 20 minutes. After that, the extraction pipeline runs against your conversations to build the graph continuously.
+On first use, the server walks you through a bootstrap conversation. It starts from a real decision you made recently. Then it works backward into the heuristics and assumptions behind it.
 
-The bootstrap tool returns questions for your agent to ask you. You answer naturally. Each answer gets classified and stored as typed nodes in the graph.
+The bootstrap tool returns questions for your agent to ask you. You answer naturally. Each answer gets captured, typed, and added to the graph. The first pass takes about 20 minutes. After that, capture keeps extending the model.
 
 ## How it works
 
-When you capture text (or an agent does on your behalf), an LLM classifies each statement against an ordered checklist. Is this a decision rule? A framework for thinking? A tension between beliefs? A preference? The checklist forces specific types before falling through to the generic "idea" bucket.
+Capture starts with typed extraction. An LLM classifies each statement against an ordered checklist — is this a decision rule? A framework for thinking? A tension between beliefs? The checklist forces specific types before falling through to "idea." Nine node types: heuristic, mental_model, tension, value, assumption, preference, question, project, idea.
 
-Each node gets:
-- A type (heuristic, mental_model, tension, value, assumption, preference, question, project, idea)
-- An epistemic tag (assertion, hypothesis, speculation)
-- A confidence score (strong, tentative, uncertain)
-- An activation level that decays over time
+Then it builds the graph automatically. Two mechanisms create edges:
 
-Typed edges connect nodes: supports, contradicts, evolved_into, depends_on. This makes it a real graph, not a flat embedding store. Agents can traverse relationships, not just retrieve by similarity.
+1. **Extraction-suggested relationships.** The LLM identifies connections between concepts during classification. "This heuristic contradicts that assumption." These become typed edges.
+2. **Vector similarity.** New nodes connect to semantically similar existing nodes. Edge types are inferred from the node type pair — a heuristic near a value becomes `derived_from`, a tension near a value becomes `contradicts`.
 
-Activation decay means the graph stays current. Values decay slowly. Ideas decay fast. If you haven't revisited or reinforced a pattern in weeks, it fades. Validated heuristics stay hot.
+The graph gets structural weighting through PageRank. Patterns that connect many other patterns rank higher. Patterns that bridge disconnected domains rank higher. Structural importance propagates through the topology.
 
-Scoring uses Reciprocal Rank Fusion across vector similarity, keyword matching, and activation. Hub dampening prevents well-connected nodes from dominating every query.
+Retrieval fuses five signals via Reciprocal Rank Fusion:
 
-## The extraction problem
+- **Vector similarity** — semantic closeness to the query
+- **Keyword overlap** — exact term matches
+- **Activation** — recency and reinforcement (decays by type: values persist, ideas fade)
+- **Outcome history** — track record from recorded decisions
+- **PageRank** — structural importance in the graph
 
-You can tell an agent to "capture that thought" mid-conversation. It won't. Not reliably. Agents follow the task at hand and forget side quests.
-
-The real path is a backend pipeline that processes your conversation transcripts on a schedule. Your conversations already contain the patterns. You just need something reading them after the fact.
-
-The capture tool supports both modes. Pass a nodeType and it stores directly. Omit nodeType and it runs inline extraction to classify the text into properly typed nodes.
+System 1 produces the pattern. System 2 gets the ranked evidence.
 
 ## Tools
 
 | Tool | What it does | Side effects |
 |------|-------------|-------------|
-| `what_do_i_think` | Query your thinking on a topic | READ-ONLY (bumps activation) |
+| `ping` | Health check with node, chunk, and edge counts plus DB path | READ-ONLY |
+| `what_do_i_think` | Query your thinking on a topic with 5-signal ranking: vector, keyword, activation, outcome, and PageRank | READ-ONLY (bumps activation) |
 | `what_connects` | Find bridges between two domains | READ-ONLY |
 | `what_tensions_exist` | Surface contradictions and weak spots | READ-ONLY |
 | `where_am_i_uncertain` | Find low-confidence or untested patterns | READ-ONLY |
-| `suggest_exploration` | Forgotten patterns near your current context | READ-ONLY |
-| `how_would_user_decide` | Reconstruct reasoning for a new decision | READ-ONLY |
+| `suggest_exploration` | Surface forgotten but structurally important nodes using similarity plus PageRank | READ-ONLY |
+| `how_would_user_decide` | Reconstruct likely reasoning for a new decision, ranked with structural importance | READ-ONLY |
 | `what_has_changed` | Timeline of how your thinking evolved | READ-ONLY |
-| `capture` | Add a thought (with or without inline extraction) | WRITES |
+| `capture` | Add a thought with typed extraction and automatic edge creation through similarity and extracted relationships | WRITES |
 | `correct` | Fix a node. Strongest learning signal. | WRITES |
 | `record_outcome` | Track what happened after a decision | WRITES |
 | `get_node` | Inspect a node with all its data | READ-ONLY |
-| `get_neighbors` | 1-hop graph traversal from a node | READ-ONLY |
+| `get_neighbors` | Return real 1-hop graph topology: connected nodes and the edges between them | READ-ONLY |
 | `search_nodes` | Keyword search with optional type filter | READ-ONLY |
 | `merge_nodes` | Combine duplicate nodes | DESTRUCTIVE |
 | `archive_node` | Drop a node from results without deleting | WRITES |
+| `get_framing` | Return lens-shaping questions to answer before any substantive response | READ-ONLY |
+| `seed_framing` | Set or replace framing directives (max 5) | DESTRUCTIVE |
 | `bootstrap` | Guided first-run Q&A (5 phases) | WRITES |
 
 ## Configuration
@@ -95,11 +97,11 @@ Embedding text goes to Voyage AI (or your configured provider). Extraction text 
 
 ## Limitations
 
-The vector search is brute-force cosine over all stored embeddings. Fine for personal use up to maybe 100K nodes. Past that you would need a real vector index.
+Vector search is brute-force cosine similarity over all stored embeddings. This keeps the system zero-infrastructure — no vector database, no external index. Fine for personal use up to roughly 100K nodes. Past that you need a real vector index.
 
-Extraction can hallucinate patterns from weak evidence. The prompt caps at 8 patterns per input and requires explicit evidence for "strong" confidence, but it is still an LLM reading your words and guessing what you meant.
+Extraction is still an LLM interpreting your language. It can overread weak evidence. The prompt caps at 8 patterns per input and requires explicit evidence for "strong" confidence, but it is making judgment calls about what you meant.
 
-The graph is only as good as the conversations you have. If you only talk about code, it will only model how you think about code.
+The graph is only as good as what enters the conversation stream. If you only talk about code, it will only model how you think about code.
 
 ---
 
