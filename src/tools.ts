@@ -1,5 +1,5 @@
 import { VALID_NODE_TYPES } from "./types.js";
-import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation } from "./db.js";
+import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation, queryOne, queryScalar } from "./db.js";
 import { embedOne, validateDims, embeddingModel, embeddingDims, vectorSearch, cosine, rrfFuse, decayedActivation, hubDampen } from "./embed.js";
 import { extractPatterns } from "./extract.js";
 import { DB_PATH } from "./types.js";
@@ -84,11 +84,23 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
     }
   }
 
-  const kw = topic.split(/\s+/).filter(w => w.length > 3).map(w => `summary LIKE '%${w}%'`).join(" OR ");
+  const words = topic.split(/\s+/).filter(w => w.length > 3).map(w => w.replace(/[%_'\\]/g, ""));
   const keywordScores = new Map<string, number>();
-  if (kw) {
-    const kwNodes = queryNodes(`SELECT id, activation FROM nodes WHERE ${kw} LIMIT 20`);
-    kwNodes.forEach((n, i) => { keywordScores.set(n.id as string, 1 / (i + 1)); });
+  if (words.length > 0) {
+    const conditions = words.map(() => "summary LIKE ?").join(" OR ");
+    const params = words.map(w => `%${w}%`);
+    const stmt = db.prepare(`SELECT id, activation FROM nodes WHERE (${conditions}) LIMIT 20`);
+    try {
+      stmt.bind(params);
+      let idx = 0;
+      while (stmt.step()) {
+        const row = stmt.getAsObject();
+        keywordScores.set(row.id as string, 1 / (idx + 1));
+        idx++;
+      }
+    } finally {
+      stmt.free();
+    }
   }
 
   const allIds = new Set([...vectorScores.keys(), ...keywordScores.keys()]);
@@ -425,12 +437,26 @@ export function toolGetNeighbors(nodeId: string): string {
 // ---------------------------------------------------------------------------
 
 export function toolSearchNodes(query: string, nodeType?: string): string {
-  const words = query.split(/\s+/).filter(w => w.length > 2).map(w => `summary LIKE '%${w}%'`);
+  const words = query.split(/\s+/).filter(w => w.length > 2).map(w => w.replace(/[%_'\\]/g, ""));
   if (words.length === 0) return JSON.stringify({ query, nodes: [] });
-  let sql = `SELECT * FROM nodes WHERE (${words.join(" OR ")})`;
-  if (nodeType && VALID_NODE_TYPES.has(nodeType)) sql += ` AND type = '${nodeType}'`;
+  const conditions = words.map(() => "summary LIKE ?").join(" OR ");
+  const params: any[] = words.map(w => `%${w}%`);
+  let sql = `SELECT * FROM nodes WHERE (${conditions})`;
+  if (nodeType && VALID_NODE_TYPES.has(nodeType)) {
+    sql += " AND type = ?";
+    params.push(nodeType);
+  }
   sql += " ORDER BY activation DESC LIMIT 20";
-  const nodes = queryNodes(sql);
+  const stmt = db.prepare(sql);
+  const nodes: Record<string, unknown>[] = [];
+  try {
+    stmt.bind(params);
+    while (stmt.step()) {
+      nodes.push(stmt.getAsObject() as Record<string, unknown>);
+    }
+  } finally {
+    stmt.free();
+  }
   return JSON.stringify({ query, type_filter: nodeType || null, count: nodes.length, nodes }, null, 2);
 }
 

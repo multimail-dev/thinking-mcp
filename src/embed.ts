@@ -1,6 +1,7 @@
 import { EMBEDDING_PROVIDER, VOYAGE_API_KEY, OPENAI_API_KEY, OLLAMA_URL } from "./types.js";
 import { db } from "./db.js";
 import { DECAY_RATES } from "./types.js";
+import { cosine } from "./cosine.js";
 
 export let embeddingModel = "";
 export let embeddingDims = 0;
@@ -68,14 +69,8 @@ export function validateDims(vector: number[]): boolean {
   return vector.length === embeddingDims;
 }
 
-export function cosine(a: number[], b: number[]): number {
-  let dot = 0, magA = 0, magB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i]; magA += a[i] * a[i]; magB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(magA) * Math.sqrt(magB);
-  return denom === 0 ? 0 : dot / denom;
-}
+// Re-export vendor-copied cosine for backward compatibility with existing imports
+export { cosine } from "./cosine.js";
 
 export function vectorSearch(queryVec: number[], topK = 20): { chunkId: string; score: number }[] {
   const rows = db.exec("SELECT chunk_id, vector FROM embeddings");
