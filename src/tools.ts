@@ -231,8 +231,10 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     return `No patterns extracted. Stored as idea. Node: ${nodeId}.${edgeNote}`;
   }
 
-  let totalEdges = 0;
-  const nodeIds: string[] = [];
+  // Two-pass flow: insert all nodes first, then create edges.
+  // This ensures intra-capture relates_to references can resolve
+  // (pattern A's relates_to might reference pattern B from the same capture).
+  const inserted: { nodeId: string; type: string; vec: number[]; relatesTo?: typeof patterns[0]["relates_to"] }[] = [];
   for (const p of patterns) {
     const chunkId = uuid(), nodeId = uuid();
     const vec = await embedOne(p.text);
@@ -241,9 +243,13 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, p.type, p.text, p.confidence || "tentative"]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+    inserted.push({ nodeId, type: p.type, vec, relatesTo: p.relates_to });
+  }
 
-    totalEdges += await autoCreateEdges(nodeId, p.type, vec, p.relates_to);
-    nodeIds.push(nodeId);
+  // Pass 2: create edges now that all nodes + embeddings exist
+  let totalEdges = 0;
+  for (const { nodeId, type, vec, relatesTo } of inserted) {
+    totalEdges += await autoCreateEdges(nodeId, type, vec, relatesTo);
   }
   persistDb();
   const summary = patterns.map(p => `${p.type}: "${p.text.slice(0, 50)}"`).join("; ");
@@ -301,7 +307,14 @@ export async function toolWhatDoIThink(topic: string): Promise<string> {
   }
 
   // PageRank: structural importance signal (5th channel)
-  const pageRankScores = computePageRank();
+  // Filter to allIds only — prevents globally important but topic-irrelevant nodes
+  // from entering the fused ranking
+  const fullPageRank = computePageRank();
+  const pageRankScores = new Map<string, number>();
+  for (const id of allIds) {
+    const pr = fullPageRank.get(id);
+    if (pr !== undefined) pageRankScores.set(id, pr);
+  }
 
   // Weights: vector 3x, keyword 3x, activation 1x, outcome 0.5x, pagerank 2x
   const fused = rrfFuse([vectorScores, keywordScores, activationScores, outcomeScores, pageRankScores], [3, 3, 1, 0.5, 2]);
@@ -677,6 +690,7 @@ export function toolMergeNodes(keepId: string, mergeId: string): string {
   db.run(`UPDATE nodes SET activation = ? WHERE id = ?`, [Math.max(keep.activation as number, merge.activation as number), keepId]);
   db.run(`DELETE FROM nodes WHERE id = ?`, [mergeId]);
 
+  invalidatePageRankCache(); // edges were rewired/deleted
   persistDb();
   return `Merged "${(merge.summary as string).slice(0, 50)}" into "${(keep.summary as string).slice(0, 50)}".`;
 }
