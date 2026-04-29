@@ -17,11 +17,17 @@ export const DECAY_RATES: Record<string, number> = {
   idea: 0.93, question: 0.93, project: 0.93,
 };
 
+export interface ExtractedRelation {
+  concept: string;
+  edge_type: string;
+}
+
 export interface ExtractedPattern {
   text: string;
   type: string;
   confidence: string;
   epistemic: string;
+  relates_to?: ExtractedRelation[];
 }
 
 export const DB_PATH = process.env.THINKING_MCP_DB_PATH
