@@ -1,8 +1,117 @@
-import { VALID_NODE_TYPES } from "./types.js";
+import { VALID_NODE_TYPES, VALID_EDGE_TYPES } from "./types.js";
+import type { ExtractedRelation } from "./types.js";
 import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation, queryOne, queryScalar } from "./db.js";
 import { embedOne, validateDims, embeddingModel, embeddingDims, vectorSearch, cosine, rrfFuse, decayedActivation, hubDampen } from "./embed.js";
 import { extractPatterns } from "./extract.js";
 import { DB_PATH } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Edge type inference heuristic
+// ---------------------------------------------------------------------------
+
+const EDGE_TYPE_MAP: Record<string, Record<string, string>> = {
+  heuristic:  { heuristic: "supports", value: "derived_from", mental_model: "scoped_by" },
+  tension:    { value: "contradicts", heuristic: "contradicts" },
+  assumption: { mental_model: "depends_on" },
+  preference: { value: "derived_from" },
+  idea:       { project: "belongs_to" },
+  question:   { assumption: "depends_on" },
+};
+
+function inferEdgeType(sourceType: string, targetType: string): string {
+  return EDGE_TYPE_MAP[sourceType]?.[targetType]
+    ?? (sourceType === targetType ? "supports" : "inspired_by");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-edge creation (Stage 1: LLM-suggested, Stage 2: similarity)
+// ---------------------------------------------------------------------------
+
+async function createEdgesFromExtraction(
+  nodeId: string, _nodeType: string,
+  relatesTo: ExtractedRelation[]
+): Promise<number> {
+  let created = 0;
+  for (const rel of relatesTo) {
+    if (!rel.concept?.trim() || rel.concept.trim().length < 2) continue;
+    if (!VALID_EDGE_TYPES.has(rel.edge_type)) continue;
+    const vec = await embedOne(rel.concept.trim());
+    if (!vec) continue;
+    const hits = vectorSearch(vec, 3);
+    for (const hit of hits) {
+      if (hit.score < 0.65) break;
+      const targetNodeId = queryScalar(
+        "SELECT node_id FROM node_chunks WHERE chunk_id = ?", [hit.chunkId]
+      ) as string | null;
+      if (!targetNodeId || targetNodeId === nodeId) continue;
+      const existing = queryScalar(
+        "SELECT COUNT(*) FROM edges WHERE type = ? AND source_node_id = ? AND target_node_id = ?",
+        [rel.edge_type, nodeId, targetNodeId]
+      );
+      if ((existing as number) > 0) continue;
+      db.run(
+        "INSERT INTO edges (id, type, source_node_id, target_node_id, weight) VALUES (?, ?, ?, ?, ?)",
+        ["ae1-" + uuid(), rel.edge_type, nodeId, targetNodeId, hit.score]
+      );
+      created++;
+      break; // one edge per relates_to entry
+    }
+  }
+  return created;
+}
+
+async function createEdgesBySimilarity(
+  nodeId: string, nodeType: string, embedding: number[]
+): Promise<number> {
+  const MAX_AUTO_EDGES = 3;
+  const hits = vectorSearch(embedding, 10);
+  let created = 0;
+  for (const hit of hits) {
+    if (created >= MAX_AUTO_EDGES) break;
+    const targetNodeId = queryScalar(
+      "SELECT node_id FROM node_chunks WHERE chunk_id = ?", [hit.chunkId]
+    ) as string | null;
+    if (!targetNodeId || targetNodeId === nodeId) continue;
+    const targetNode = getNode(targetNodeId);
+    if (!targetNode) continue;
+    const threshold = targetNode.type === nodeType ? 0.75 : 0.80;
+    if (hit.score < threshold) continue;
+    const edgeType = inferEdgeType(nodeType, targetNode.type as string);
+    const existing = queryScalar(
+      "SELECT COUNT(*) FROM edges WHERE source_node_id = ? AND target_node_id = ?",
+      [nodeId, targetNodeId]
+    );
+    if ((existing as number) > 0) continue;
+    db.run(
+      "INSERT INTO edges (id, type, source_node_id, target_node_id, weight) VALUES (?, ?, ?, ?, ?)",
+      ["ae2-" + uuid(), edgeType, nodeId, targetNodeId, hit.score]
+    );
+    created++;
+  }
+  return created;
+}
+
+/**
+ * Create edges for a newly captured node. Wraps both stages in try/catch
+ * so edge creation failures never block capture.
+ */
+async function autoCreateEdges(
+  nodeId: string, nodeType: string, embedding: number[],
+  relatesTo?: ExtractedRelation[]
+): Promise<number> {
+  let totalEdges = 0;
+  try {
+    // Stage 1: LLM-suggested edges from extraction
+    if (relatesTo && relatesTo.length > 0) {
+      totalEdges += await createEdgesFromExtraction(nodeId, nodeType, relatesTo);
+    }
+    // Stage 2: vector-similarity fallback
+    totalEdges += await createEdgesBySimilarity(nodeId, nodeType, embedding);
+  } catch (e) {
+    console.error("Auto-edge creation error (non-fatal):", e);
+  }
+  return totalEdges;
+}
 
 // ---------------------------------------------------------------------------
 // ping
@@ -31,8 +140,11 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, nodeType, text, confidence]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    const edgeCount = await autoCreateEdges(nodeId, nodeType, vec);
     persistDb();
-    return `Captured as ${nodeType} (${epistemicTag}, ${confidence}). Node: ${nodeId}`;
+    const edgeNote = edgeCount > 0 ? ` ${edgeCount} edge(s) created.` : "";
+    return `Captured as ${nodeType} (${epistemicTag}, ${confidence}). Node: ${nodeId}.${edgeNote}`;
   }
 
   const patterns = await extractPatterns(text);
@@ -44,10 +156,14 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, "idea", text, confidence]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    const edgeCount = await autoCreateEdges(nodeId, "idea", vec);
     persistDb();
-    return `No patterns extracted. Stored as idea. Node: ${nodeId}`;
+    const edgeNote = edgeCount > 0 ? ` ${edgeCount} edge(s) created.` : "";
+    return `No patterns extracted. Stored as idea. Node: ${nodeId}.${edgeNote}`;
   }
 
+  let totalEdges = 0;
   const nodeIds: string[] = [];
   for (const p of patterns) {
     const chunkId = uuid(), nodeId = uuid();
@@ -57,11 +173,14 @@ export async function toolCapture(text: string, nodeType?: string, epistemicTag 
     db.run("INSERT INTO nodes (id, type, summary, confidence, activation) VALUES (?, ?, ?, ?, 1.0)", [nodeId, p.type, p.text, p.confidence || "tentative"]);
     db.run("INSERT INTO node_chunks (node_id, chunk_id) VALUES (?, ?)", [nodeId, chunkId]);
     db.run("INSERT INTO embeddings (chunk_id, vector, model, dims) VALUES (?, ?, ?, ?)", [chunkId, JSON.stringify(vec), embeddingModel, embeddingDims]);
+
+    totalEdges += await autoCreateEdges(nodeId, p.type, vec, p.relates_to);
     nodeIds.push(nodeId);
   }
   persistDb();
   const summary = patterns.map(p => `${p.type}: "${p.text.slice(0, 50)}"`).join("; ");
-  return `Extracted ${patterns.length} pattern(s): ${summary}`;
+  const edgeNote = totalEdges > 0 ? ` ${totalEdges} edge(s) created.` : "";
+  return `Extracted ${patterns.length} pattern(s): ${summary}.${edgeNote}`;
 }
 
 // ---------------------------------------------------------------------------
