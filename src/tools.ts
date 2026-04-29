@@ -1,3 +1,19 @@
+/**
+ * Consumer trace (Sharp Directive 1):
+ *
+ * This file imports from: types.ts, db.ts, embed.ts, extract.ts, pagerank.ts
+ * This file is imported by: index.ts (tool registration only, no signature changes)
+ *
+ * Changed surfaces in this PR and their consumers:
+ *   cosine.ts (new) → embed.ts re-exports it; tools.ts consumes via embed.ts. Same signature.
+ *   db.ts (queryOne/queryScalar new; getNode/bumpActivation parameterized) → tools.ts only consumer. Signatures unchanged.
+ *   embed.ts (cosine re-export replaces inline) → tools.ts imports cosine. Name+signature identical.
+ *   extract.ts (prompt extended; relates_to validation) → tools.ts calls extractPatterns(). Return type unchanged.
+ *   types.ts (ExtractedRelation new; relates_to optional on ExtractedPattern) → extract.ts, tools.ts. Optional field.
+ *   pagerank.ts (new) → tools.ts only consumer.
+ *   index.ts (description text) → entry point, not imported by anything.
+ *   bootstrap.ts → unchanged, not affected.
+ */
 import { VALID_NODE_TYPES, VALID_EDGE_TYPES } from "./types.js";
 import type { ExtractedRelation } from "./types.js";
 import { db, persistDb, uuid, now, getNode, queryNodes, bumpActivation, queryOne, queryScalar } from "./db.js";
