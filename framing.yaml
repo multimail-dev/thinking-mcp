@@ -1,0 +1,27 @@
+# framing.yaml — starter directives for thinking-mcp
+#
+# These questions are asked before every substantive response.
+# They shape HOW the agent thinks, not WHAT it knows.
+#
+# Replace these with your own. The best directives are the ones
+# that force you to think about what you'd otherwise skip.
+# Hard cap: 5 directives.
+
+directives:
+  - id: goal_clarity
+    question: "What specifically am I trying to achieve, and how will I know it worked?"
+    rationale: "Forces explicit success criteria before acting. Prevents motion without direction."
+    priority: 1
+    version: 1
+
+  - id: second_order
+    question: "What happens after this works? What does it unlock or block?"
+    rationale: "Prevents local optimization that creates downstream problems."
+    priority: 2
+    version: 1
+
+  - id: reversal_cost
+    question: "If this turns out to be wrong, how hard is it to undo?"
+    rationale: "Calibrates effort to reversibility. Cheap-to-reverse decisions deserve less deliberation."
+    priority: 3
+    version: 1

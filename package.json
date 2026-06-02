@@ -1,0 +1,48 @@
+{
+  "name": "@multimail/thinking-mcp",
+  "version": "0.2.0",
+  "description": "MCP server that models how you think, not what you know",
+  "type": "module",
+  "bin": {
+    "thinking-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && chmod 755 dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepare": "bun run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "js-yaml": "^4.1.0",
+    "sql.js": "^1.14.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.8.0"
+  },
+  "keywords": [
+    "mcp",
+    "cognitive",
+    "knowledge-graph",
+    "thinking",
+    "mental-model"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/multimail-dev/thinking-mcp"
+  },
+  "homepage": "https://multimail.dev",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
